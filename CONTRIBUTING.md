@@ -93,6 +93,21 @@ If you need guidance on setting up your local environment keys, refer to the [RE
 
 ---
 
+🛠 Tech Stack
+This project uses:
+
+Language: Python 3.10+
+
+Framework: Streamlit (UI)
+
+AI/LLM: LangChain, Google Generative AI (Gemini)
+
+Vector Store: FAISS
+
+Environment: python-dotenv
+
+---
+
 ## ✅ Prerequisites
 
 Before you begin, ensure you have the following installed:
