@@ -6,14 +6,14 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from groq import Groq
 from dotenv import load_dotenv
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 import os
 import re
 import uvicorn
-import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
 load_dotenv()
 
@@ -21,15 +21,20 @@ app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
+# ---------------------------------------------------------------------------
+# GROQ CLIENT  (replaces local HuggingFace model)
+# ---------------------------------------------------------------------------
+
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")   # fast & smart
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
 # Temporary global variables
 vectorstore = None
-qa_chain = False
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
+qa_chain    = False
 
-# Load local embedding model
+# Load local embedding model (embeddings stay local – no change)
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
@@ -61,74 +66,73 @@ def normalize_answer(text: str) -> str:
     """
     Post-processes the LLM-generated answer:
     - Removes any residual character-level spacing.
-    - Strips prompt leakage (lines starting with 'Answer', 'Context', etc.)
+    - Strips prompt-leakage prefixes the model might echo.
     - Collapses excessive whitespace.
     """
-    # Remove residual character spacing in the answer itself
     text = normalize_spaced_text(text)
-    # Strip any prompt-leakage prefixes the model might echo
-    text = re.sub(r'^(Answer[^:]*:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
-    # Collapse multiple spaces/newlines
+    # Strip only clear prompt-echo artefacts at the very start
+    text = re.sub(r'^(Final Answer:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'[ \t]{2,}', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# MODEL LOADING & GENERATION
+# CCC PROMPT TEMPLATE  (Connect – Content – Continue)
 # ---------------------------------------------------------------------------
 
-def load_generation_model():
-    global generation_tokenizer, generation_model, generation_is_encoder_decoder
-    if generation_model is not None and generation_tokenizer is not None:
-        return generation_tokenizer, generation_model, generation_is_encoder_decoder
+_CCC_SYSTEM = (
+    "You are an intelligent PDF Question Answering Assistant.\n"
+    "Your task is to answer the user's question strictly using the provided context "
+    "retrieved from uploaded documents.\n\n"
+    "Follow the CCC communication structure in a SINGLE response:\n\n"
+    "1. Context Connection — Start with a short professional greeting (e.g. \"Hello,\").\n"
+    "2. Content Explanation — Rewrite the retrieved context in clear, meaningful, "
+    "grammatically correct sentences. Do NOT copy text directly.\n"
+    "3. Core Answer — Present the main explanation in a structured, readable format.\n"
+    "4. Call to Action — End with a relevant follow-up question to encourage further exploration.\n\n"
+    "Rules:\n"
+    "- Use ONLY the provided context. Do NOT add external knowledge.\n"
+    "- If the answer is not in the context, say: "
+    "\"The uploaded document does not contain sufficient information to answer this question.\"\n"
+    "- Maintain a clear, professional tone.\n"
+    "- Produce one continuous response — no bullet headers like '1.' or '2.'."
+)
 
-    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+_CCC_USER_TEMPLATE = """\
+Context from the uploaded PDF:
+{context}
 
-    if generation_is_encoder_decoder:
-        generation_model = AutoModelForSeq2SeqLM.from_pretrained(
-            HF_GENERATION_MODEL,
-            low_cpu_mem_usage=False
-        )
-    else:
-        generation_model = AutoModelForCausalLM.from_pretrained(
-            HF_GENERATION_MODEL,
-            low_cpu_mem_usage=False
-        )
+Question:
+{question}
 
-    if torch.cuda.is_available():
-        generation_model = generation_model.to("cuda")
+Final Answer:"""
 
-    generation_model.eval()
-    return generation_tokenizer, generation_model, generation_is_encoder_decoder
+CCC_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=_CCC_USER_TEMPLATE,
+)
 
 
-def generate_response(prompt: str, max_new_tokens: int) -> str:
-    tokenizer, model, is_encoder_decoder = load_generation_model()
-    model_device = next(model.parameters()).device
+# ---------------------------------------------------------------------------
+# GROQ GENERATION
+# ---------------------------------------------------------------------------
 
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {key: value.to(model_device) for key, value in encoded.items()}
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
-
-    if is_encoder_decoder:
-        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        return text.strip()
-
-    input_len = encoded["input_ids"].shape[1]
-    new_tokens = generated_ids[0][input_len:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return text.strip()
+def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
+    """
+    Calls the Groq chat-completions API with a system + user message pair.
+    Returns the assistant's reply as a plain string.
+    """
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.3,     # low temp = factual, grounded answers
+    )
+    return completion.choices[0].message.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +145,6 @@ class PDFPath(BaseModel):
 class AskRequest(BaseModel):
     question: str
     history: list = []
-
 
 class SummarizeRequest(BaseModel):
     pdf: str | None = None
@@ -156,23 +159,22 @@ class SummarizeRequest(BaseModel):
 def process_pdf(request: Request, data: PDFPath):
     global vectorstore, qa_chain
 
-    loader = PyPDFLoader(data.filePath)
+    loader   = PyPDFLoader(data.filePath)
     raw_docs = loader.load()
 
-    # ── Layer 1: normalize at ingestion ──────────────────────────────────────
-    # Clean each page's text before chunking so embeddings are on real words.
+    # Layer 1: normalize at ingestion so embeddings are on real words
     cleaned_docs = []
     for doc in raw_docs:
         cleaned_content = normalize_spaced_text(doc.page_content)
         cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_documents(cleaned_docs)
+    chunks   = splitter.split_documents(cleaned_docs)
     if not chunks:
         return {"error": "No text chunks generated from the PDF. Please check your file."}
 
     vectorstore = FAISS.from_documents(chunks, embedding_model)
-    qa_chain = True
+    qa_chain    = True
 
     return {"message": "PDF processed successfully"}
 
@@ -183,44 +185,45 @@ def ask_question(request: Request, data: AskRequest):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"answer": "Please upload a PDF first!"}
+
     question = data.question
-    history = data.history
+    history  = data.history
+
+    # Build conversation context from last 5 turns
     conversation_context = ""
-    # Use only last 5 messages to avoid long prompts
     for msg in history[-5:]:
-        role = msg.get("role", "")
+        role    = msg.get("role", "")
         content = msg.get("content", "")
         conversation_context += f"{role}: {content}\n"
+
+    # Retrieve top-4 relevant chunks
     docs = vectorstore.similarity_search(question, k=4)
     if not docs:
-        return {"answer": "No relevant context found."}
+        return {"answer": "No relevant context found in the uploaded document."}
 
-    # ── Layer 2a: context is already clean (normalized at ingestion) ──────────
+    # Context is already clean (normalized at ingestion)
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = f"""
-    You are a helpful assistant answering questions from a PDF document.
+    # Merge conversation history into the question slot
+    question_with_history = question
+    if conversation_context.strip():
+        question_with_history = (
+            f"Conversation so far:\n{conversation_context.strip()}\n\n"
+            f"Current Question: {question}"
+        )
 
-    Conversation History:
-    {conversation_context}
+    # Build user turn from CCC template — single LLM call
+    user_prompt = CCC_PROMPT.format(
+        context=context,
+        question=question_with_history,
+    )
 
-    Document Context:
-    {context}
+    raw_answer = generate_response(
+        system_prompt=_CCC_SYSTEM,
+        user_prompt=user_prompt,
+        max_tokens=600,
+    )
 
-    Current Question:
-    {question}
-
-    Instructions:
-    - Use the document context to answer.
-    - If the answer is not in the document, say so briefly.
-    - Keep the answer concise.
-
-    Answer:
-    """
-
-    raw_answer = generate_response(prompt, max_new_tokens=128)
-
-    # ── Layer 3: post-process the answer itself ───────────────────────────────
     answer = normalize_answer(raw_answer)
     return {"answer": answer}
 
@@ -236,23 +239,22 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     if not docs:
         return {"summary": "No document context available to summarize."}
 
-    # Context is already clean (normalized at ingestion)
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = (
-        "You are a document summarization assistant working with a certificate or official document.\n"
-        "RULES:\n"
+    system_prompt = (
+        "You are a document summarization assistant.\n"
+        "Rules:\n"
         "1. Summarize in 6-8 concise bullet points.\n"
-        "2. Clearly distinguish: who received the certificate, what course, which company issued it,\n"
-        "   who signed it, on what platform, and on what date.\n"
-        "3. Return clean, properly formatted text — no character spacing, proper Title Case for names.\n"
-        "4. Use ONLY the information in the context below.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary (bullet points):"
+        "2. Clearly state: who received the certificate/document, what it is for, "
+        "which organization issued it, who authorized it, and the date.\n"
+        "3. Use proper Title Case for names. Return clean, readable text.\n"
+        "4. Use ONLY the information in the provided context."
     )
 
-    raw_summary = generate_response(prompt, max_new_tokens=256)
-    summary = normalize_answer(raw_summary)
+    user_prompt = f"Context:\n{context}\n\nSummary (bullet points):"
+
+    raw_summary = generate_response(system_prompt, user_prompt, max_tokens=400)
+    summary     = normalize_answer(raw_summary)
     return {"summary": summary}
 
 
