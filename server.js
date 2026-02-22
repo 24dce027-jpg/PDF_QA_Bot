@@ -5,12 +5,23 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const rateLimit = require("express-rate-limit");
+const session = require("express-session");
 
-let chatHistory = [];
 const app = express();
 app.use(cors());
 app.set('trust proxy', 1); // Fix ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
 app.use(express.json());
+
+// Session middleware for per-user chat history
+app.use(session({
+  secret: "pdf-qa-bot-secret-key",
+  resave: false,
+  saveUninitialized: true,
+  cookie: { 
+    secure: false,
+    maxAge: 1000 * 60 * 60 * 24 // 24 hours
+  }
+}));
 
 // Rate limiting middleware
 const uploadLimiter = rateLimit({
@@ -69,9 +80,14 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 app.post("/ask", askLimiter, async (req, res) => {
   try {
     const question = req.body.question;
+    
+    // Initialize session chat history if it doesn't exist
+    if (!req.session.chatHistory) {
+      req.session.chatHistory = [];
+    }
 
-    // Add user message to history
-    chatHistory.push({
+    // Add user message to session history
+    req.session.chatHistory.push({
       role: "user",
       content: question
     });
@@ -81,12 +97,12 @@ app.post("/ask", askLimiter, async (req, res) => {
       "http://localhost:5000/ask",
       {
         question: question,
-        history: chatHistory
+        history: req.session.chatHistory
       }
     );
 
-    // Add assistant response to history
-    chatHistory.push({
+    // Add assistant response to session history
+    req.session.chatHistory.push({
       role: "assistant",
       content: response.data.answer
     });
@@ -100,7 +116,10 @@ app.post("/ask", askLimiter, async (req, res) => {
 });
 
 app.post("/clear-history", (req, res) => {
-  chatHistory = [];
+  // Clear only this user's session history
+  if (req.session) {
+    req.session.chatHistory = [];
+  }
   res.json({ message: "History cleared" });
 });
 
