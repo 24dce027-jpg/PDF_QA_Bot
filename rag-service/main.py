@@ -7,11 +7,10 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from dotenv import load_dotenv
+from groq import Groq
 import os
 import re
 import uvicorn
-import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -21,15 +20,26 @@ app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
+# ---------------------------------------------------------------------------
+# GROQ CLIENT SETUP
+# ---------------------------------------------------------------------------
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Please add it to your .env file.\n"
+        "Get a free key at https://console.groq.com"
+    )
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
 # Temporary global variables
 vectorstore = None
 qa_chain = False
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
 
-# Load local embedding model
+# Load local embedding model (unchanged — FAISS retrieval stays the same)
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
@@ -75,60 +85,26 @@ def normalize_answer(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MODEL LOADING & GENERATION
+# GROQ-BASED RESPONSE GENERATION
 # ---------------------------------------------------------------------------
 
-def load_generation_model():
-    global generation_tokenizer, generation_model, generation_is_encoder_decoder
-    if generation_model is not None and generation_tokenizer is not None:
-        return generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
-
-    if generation_is_encoder_decoder:
-        generation_model = AutoModelForSeq2SeqLM.from_pretrained(
-            HF_GENERATION_MODEL,
-            low_cpu_mem_usage=False
-        )
-    else:
-        generation_model = AutoModelForCausalLM.from_pretrained(
-            HF_GENERATION_MODEL,
-            low_cpu_mem_usage=False
-        )
-
-    if torch.cuda.is_available():
-        generation_model = generation_model.to("cuda")
-
-    generation_model.eval()
-    return generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-
-def generate_response(prompt: str, max_new_tokens: int) -> str:
-    tokenizer, model, is_encoder_decoder = load_generation_model()
-    model_device = next(model.parameters()).device
-
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {key: value.to(model_device) for key, value in encoded.items()}
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
-
-    if is_encoder_decoder:
-        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        return text.strip()
-
-    input_len = encoded["input_ids"].shape[1]
-    new_tokens = generated_ids[0][input_len:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return text.strip()
+def generate_response(prompt: str, max_new_tokens: int = 512) -> str:
+    """
+    Sends the prompt to the Groq API using the configured llama-3.3-70b-versatile
+    model and returns the generated text.
+    """
+    chat_completion = groq_client.chat.completions.create(
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        model=GROQ_MODEL,
+        max_tokens=max_new_tokens,
+        temperature=0.2,
+    )
+    return chat_completion.choices[0].message.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +194,7 @@ def ask_question(request: Request, data: AskRequest):
     Answer:
     """
 
-    raw_answer = generate_response(prompt, max_new_tokens=128)
+    raw_answer = generate_response(prompt, max_new_tokens=512)
 
     # ── Layer 3: post-process the answer itself ───────────────────────────────
     answer = normalize_answer(raw_answer)
@@ -251,7 +227,7 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
         "Summary (bullet points):"
     )
 
-    raw_summary = generate_response(prompt, max_new_tokens=256)
+    raw_summary = generate_response(prompt, max_new_tokens=512)
     summary = normalize_answer(raw_summary)
     return {"summary": summary}
 
