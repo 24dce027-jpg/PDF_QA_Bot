@@ -9,6 +9,7 @@ const session = require("express-session");
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
+app.set('trust proxy', 1); // Fix ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
 app.use(express.json());
 
 // Session middleware for per-user chat history
@@ -130,6 +131,7 @@ app.post("/ask", askLimiter, async (req, res) => {
     console.error(error.message);
     res.status(500).json({ error: "Error asking question" });
   }
+  res.json({ message: "History cleared" });
 });
 
 app.post("/clear-history", (req, res) => {
