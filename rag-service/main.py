@@ -11,15 +11,10 @@ from groq import Groq
 from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from groq import Groq
 import os
 import re
 import uvicorn
-import torch
 import time
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
 load_dotenv()
 
@@ -42,13 +37,9 @@ if not GROQ_API_KEY:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Temporary global variables
-vectorstore = None
-qa_chain = False
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
+# Session management
+sessions = {}
+SESSION_TIMEOUT = 3600  # 1 hour
 
 # Load local embedding model
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -62,13 +53,6 @@ def normalize_spaced_text(text: str) -> str:
     """
     Fixes character-level spaced text produced by PyPDFLoader on certain
     vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
-
-    Examples:
-        'J A I N I   S O L A N K I'  ->  'JAINI SOLANKI'
-        'I B M'                       ->  'IBM'
-        'N P T E L'                   ->  'NPTEL'
-
-    Normal multi-letter words are left completely untouched.
     """
     def fix_spaced_word(match):
         return match.group(0).replace(" ", "")
@@ -80,10 +64,7 @@ def normalize_spaced_text(text: str) -> str:
 
 def normalize_answer(text: str) -> str:
     """
-    Post-processes the LLM-generated answer:
-    - Removes any residual character-level spacing.
-    - Strips prompt-leakage prefixes the model might echo.
-    - Collapses excessive whitespace.
+    Post-processes the LLM-generated answer.
     """
     text = normalize_spaced_text(text)
     # Strip only clear prompt-echo artefacts at the very start
@@ -94,7 +75,7 @@ def normalize_answer(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GROQ-BASED RESPONSE GENERATION
+# CCC PROMPT TEMPLATE (Connect – Content – Continue)
 # ---------------------------------------------------------------------------
 
 _CCC_SYSTEM = (
@@ -137,7 +118,6 @@ CCC_PROMPT = PromptTemplate(
 def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
     """
     Calls the Groq chat-completions API with a system + user message pair.
-    Returns the assistant's reply as a plain string.
     """
     completion = groq_client.chat.completions.create(
         model=GROQ_MODEL,
@@ -146,7 +126,7 @@ def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 60
             {"role": "user",   "content": user_prompt},
         ],
         max_tokens=max_tokens,
-        temperature=0.3,     # low temp = factual, grounded answers
+        temperature=0.3,
     )
     return completion.choices[0].message.content.strip()
 
@@ -165,8 +145,9 @@ class AskRequest(BaseModel):
     history: list = []
 
 class SummarizeRequest(BaseModel):
-    pdf: str | None = None
     session_id: str
+    pdf: str | None = None
+
 
 def cleanup_expired_sessions():
     current_time = time.time()
@@ -179,27 +160,21 @@ def cleanup_expired_sessions():
 # ENDPOINTS
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# ENDPOINTS
-# ---------------------------------------------------------------------------
-
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
 def process_pdf(request: Request, data: PDFPath):
     cleanup_expired_sessions()
 
-    loader   = PyPDFLoader(data.filePath)
+    loader = PyPDFLoader(data.filePath)
     raw_docs = loader.load()
 
-    # Layer 1: normalize at ingestion so embeddings are on real words
     cleaned_docs = []
     for doc in raw_docs:
         cleaned_content = normalize_spaced_text(doc.page_content)
         cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks   = splitter.split_documents(cleaned_docs)
+    chunks = splitter.split_documents(cleaned_docs)
     if not chunks:
         return {"error": "No text chunks generated from the PDF. Please check your file."}
 
@@ -224,24 +199,20 @@ def ask_question(request: Request, data: AskRequest):
     vectorstore = session_data["vectorstore"]
 
     question = data.question
-    history  = data.history
+    history = data.history
 
-    # Build conversation context from last 5 turns
     conversation_context = ""
     for msg in history[-5:]:
-        role    = msg.get("role", "")
+        role = msg.get("role", "")
         content = msg.get("content", "")
         conversation_context += f"{role}: {content}\n"
 
-    # Retrieve top-4 relevant chunks
     docs = vectorstore.similarity_search(question, k=4)
     if not docs:
         return {"answer": "No relevant context found in the uploaded document."}
 
-    # Context is already clean (normalized at ingestion)
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    # Merge conversation history into the question slot
     question_with_history = question
     if conversation_context.strip():
         question_with_history = (
@@ -249,15 +220,17 @@ def ask_question(request: Request, data: AskRequest):
             f"Current Question: {question}"
         )
 
-    # Build user turn from CCC template — single LLM call
     user_prompt = CCC_PROMPT.format(
         context=context,
         question=question_with_history,
     )
 
-    raw_answer = generate_response(prompt, max_new_tokens=128)
+    raw_answer = generate_response(
+        system_prompt=_CCC_SYSTEM,
+        user_prompt=user_prompt,
+        max_tokens=600,
+    )
 
-    # ── Layer 3: post-process the answer itself ───────────────────────────────
     answer = normalize_answer(raw_answer)
     return {"answer": answer}
 
@@ -292,7 +265,11 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 
     user_prompt = f"Context:\n{context}\n\nSummary (bullet points):"
 
-    raw_summary = generate_response(prompt, max_new_tokens=256)
+    raw_summary = generate_response(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=512
+    )
     summary = normalize_answer(raw_summary)
     return {"summary": summary}
 

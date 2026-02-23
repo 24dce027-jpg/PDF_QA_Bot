@@ -9,7 +9,6 @@ const session = require("express-session");
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
-app.set('trust proxy', 1); // Fix ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
 app.use(express.json());
 
 // Session middleware for per-user chat history
@@ -89,8 +88,13 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       session_id: sessionId,
     });
 
-    res.json({ doc_id: response.data.doc_id });
+    // Use filename as a fallback doc_id if one isn't returned
+    res.json({
+      message: response.data.message,
+      doc_id: response.data.doc_id || req.file.filename
+    });
   } catch (err) {
+    console.error("Upload failed:", err.message);
     res.status(500).json({ error: "Upload failed" });
   }
 });
@@ -128,10 +132,9 @@ app.post("/ask", askLimiter, async (req, res) => {
 
     res.json(response.data);
   } catch (error) {
-    console.error(error.message);
+    console.error("Ask failed:", error.message);
     res.status(500).json({ error: "Error asking question" });
   }
-  res.json({ message: "History cleared" });
 });
 
 app.post("/clear-history", (req, res) => {
@@ -155,12 +158,17 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
     });
     res.json({ summary: response.data.summary });
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error("Summarize failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Error summarizing PDF" });
   }
 });
 
 app.post("/compare", compareLimiter, async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing sessionId." });
+  }
+
   try {
     const response = await axios.post(
       "http://localhost:5000/compare",
@@ -168,7 +176,7 @@ app.post("/compare", compareLimiter, async (req, res) => {
     );
     res.json({ comparison: response.data.comparison });
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error("Compare failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Error comparing documents" });
   }
 });
