@@ -276,6 +276,71 @@ npm start
 
 Open: `http://localhost:3000`
 
+## Docker Deployment
+
+For production deployment or simplified development setup, you can use Docker Compose to run all services with proper health checks and dependency management.
+
+### Quick Start with Docker
+
+```bash
+# Build and start all services
+docker-compose up --build
+
+# Or run in background
+docker-compose up --build -d
+
+# Check service status
+docker-compose ps
+```
+
+### Health Check Verification
+
+All services include health and readiness endpoints for monitoring and debugging:
+
+#### Gateway Service (Node.js)
+
+```bash
+# Basic health check
+curl http://localhost:4000/healthz
+
+# Readiness check (includes RAG service connectivity)
+curl http://localhost:4000/readyz
+```
+
+#### RAG Service (FastAPI)
+
+```bash
+# Basic health check
+curl http://localhost:5000/healthz
+
+# Readiness check (includes model and component status)
+curl http://localhost:5000/readyz
+```
+
+#### Docker Health Status
+
+```bash
+# View service health in Docker Compose
+docker-compose ps
+
+# View health check logs
+docker-compose logs gateway
+docker-compose logs rag-service
+```
+
+### Service Health States
+
+- **🟢 Healthy**: Service is up and responding
+- **🟡 Starting**: Service is starting up (grace period)
+- **🔴 Unhealthy**: Service failed multiple health checks
+
+The Docker Compose setup ensures:
+
+- RAG service starts and is healthy before gateway starts
+- Gateway waits for RAG service to be ready before accepting requests
+- Frontend waits for gateway to be healthy before starting
+- Automatic restart on health check failures
+
 ## API Endpoints
 
 ### Node backend (`http://localhost:4000`)

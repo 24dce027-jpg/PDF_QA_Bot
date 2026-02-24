@@ -61,6 +61,45 @@ Base.metadata.create_all(bind=engine)
 app.include_router(auth_router)
 
 # ===============================
+# HEALTH AND READINESS ENDPOINTS
+# ===============================
+@app.get("/healthz")
+def health_check():
+    """Health check endpoint - returns 200 if service is running"""
+    return {"status": "healthy", "service": "pdf-qa-rag"}
+
+@app.get("/readyz")
+def readiness_check():
+    """Readiness check endpoint - returns 200 if service is ready to handle requests"""
+    from fastapi import HTTPException
+    
+    try:
+        # Check if embedding model is available
+        if embedding_model is None:
+            raise HTTPException(status_code=503, detail={"status": "not ready", "error": "Embedding model not initialized"})
+        
+        # Check if we can load generation models
+        try:
+            load_generation_model()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail={"status": "not ready", "error": f"Generation model not ready: {str(e)}"})
+        
+        # All checks passed
+        return {
+            "status": "ready", 
+            "service": "pdf-qa-rag",
+            "components": {
+                "embedding_model": "ready",
+                "generation_model": "ready",
+                "vector_store": "available" if VECTOR_STORE is not None else "empty"
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={"status": "not ready", "error": str(e)})
+
+# ===============================
 # RATE LIMITING SETUP 
 # ===============================
 limiter = Limiter(key_func=get_remote_address)
