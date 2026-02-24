@@ -10,6 +10,7 @@ langchain-core
 sentence-transformers
 faiss-cpu
 pypdf
+python-docx
 requests
 numpy
 slowapi

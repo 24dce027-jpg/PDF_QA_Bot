@@ -1,6 +1,5 @@
-from fastapi import FastAPI
-from fastapi import Request
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -16,7 +15,13 @@ import re
 import uvicorn
 import time
 
+# -------------------------------------------------------------------
+# APP SETUP
+# -------------------------------------------------------------------
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
 
 app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
@@ -41,14 +46,13 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
 
-# Load local embedding model
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
-
-# ---------------------------------------------------------------------------
-# TEXT NORMALIZATION UTILITIES
-# ---------------------------------------------------------------------------
-
+# -------------------------------------------------------------------
+# TEXT NORMALIZATION
+# -------------------------------------------------------------------
 def normalize_spaced_text(text: str) -> str:
     """
     Fixes character-level spaced text produced by PyPDFLoader on certain
@@ -56,10 +60,8 @@ def normalize_spaced_text(text: str) -> str:
     """
     def fix_spaced_word(match):
         return match.group(0).replace(" ", "")
-
-    # Pattern: 3+ single alpha chars each separated by exactly one space
-    pattern = r'\b(?:[A-Za-z] ){2,}[A-Za-z]\b'
-    return re.sub(pattern, fix_spaced_word, text)
+    pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
+    return re.sub(pattern, fix, text)
 
 
 def normalize_answer(text: str) -> str:
@@ -131,16 +133,17 @@ def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 60
     return completion.choices[0].message.content.strip()
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # REQUEST MODELS
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 
-class PDFPath(BaseModel):
+class DocumentPath(BaseModel):
     filePath: str
     session_id: str
 
+
 class AskRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1, max_length=2000)
     session_id: str
     history: list = []
 
@@ -149,41 +152,109 @@ class SummarizeRequest(BaseModel):
     pdf: str | None = None
 
 
+# -------------------------------------------------------------------
+# SESSION CLEANUP
+# -------------------------------------------------------------------
 def cleanup_expired_sessions():
-    current_time = time.time()
-    expired = [sid for sid, data in sessions.items() if current_time - data["last_accessed"] > SESSION_TIMEOUT]
+    now = time.time()
+    expired = [
+        sid for sid, s in sessions.items()
+        if now - s["last_accessed"] > SESSION_TIMEOUT
+    ]
     for sid in expired:
         del sessions[sid]
 
-
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # ENDPOINTS
 # ---------------------------------------------------------------------------
 
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
-def process_pdf(request: Request, data: PDFPath):
+def process_pdf(request: Request, data: DocumentPath):
     cleanup_expired_sessions()
 
-    loader = PyPDFLoader(data.filePath)
-    raw_docs = loader.load()
+    # Resolve and validate path (prevent path traversal)
+    file_path = Path(data.filePath).resolve()
+
+    if not str(file_path).startswith(str(UPLOAD_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    ext = file_path.suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format: {ext}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
+        )
+
+    try:
+        raw_docs = load_document(str(file_path))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
 
     cleaned_docs = []
     for doc in raw_docs:
         cleaned_content = normalize_spaced_text(doc.page_content)
         cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(cleaned_docs)
+
     if not chunks:
-        return {"error": "No text chunks generated from the PDF. Please check your file."}
+        raise HTTPException(
+            status_code=400,
+            detail="No text extracted from the document."
+        )
 
     sessions[data.session_id] = {
         "vectorstore": FAISS.from_documents(chunks, embedding_model),
-        "last_accessed": time.time()
+        "last_accessed": time.time(),
     }
 
-    return {"message": "PDF processed successfully"}
+    return {"message": "Document processed successfully"}
+
+# ===============================
+# RELEVANCE CONFIGURATION
+# ===============================
+# Uses cosine similarity (0 to 1) instead of raw L2 distance.
+# 0.0 = completely unrelated, 1.0 = identical match.
+# NOTE: The conversion from FAISS scores to cosine similarity assumes that
+# embeddings are L2-normalized and that FAISS uses IndexFlatL2 (L2 squared).
+RELEVANCE_THRESHOLD = 0.25  # Minimum cosine similarity for relevance
+
+
+def faiss_score_to_cosine_sim(score: float) -> float:
+    """Convert a FAISS L2 squared distance score to cosine similarity.
+
+    Assumptions:
+    - Embedding vectors are L2-normalized (||v|| = 1). True for many
+      sentence-transformer models including all-MiniLM-L6-v2.
+    - The FAISS index returns L2 squared distances (e.g., IndexFlatL2).
+
+    Under these conditions:
+        ||u - v||^2 = 2 - 2 * cos(theta)
+        => cos(theta) = 1 - (||u - v||^2 / 2)
+
+    The returned value is clamped to [0.0, 1.0] for numerical stability.
+    """
+    return max(0.0, 1.0 - score / 2.0)
+
+
+def compute_confidence(faiss_scores: list[float]) -> float:
+    """Compute confidence (0-100%) from FAISS scores using the top-3 chunks.
+
+    The provided FAISS scores are assumed to be L2 squared distances for
+    L2-normalized embeddings (see ``faiss_score_to_cosine_sim``). Scores are
+    converted to cosine similarities and the top-3 most relevant chunks are
+    averaged to produce a confidence value in percent.
+    """
+    if not faiss_scores:
+        return 0.0
+    top_scores = sorted(faiss_scores)[:3]
+    similarities = [faiss_score_to_cosine_sim(s) for s in top_scores]
+    avg_sim = sum(similarities) / len(similarities)
+    return round(float(avg_sim * 100), 1)
 
 
 @app.post("/ask")
@@ -193,7 +264,7 @@ def ask_question(request: Request, data: AskRequest):
 
     session_data = sessions.get(data.session_id)
     if not session_data:
-        return {"answer": "Session expired or no PDF uploaded for this session!"}
+        return {"answer": "Session expired or no PDF uploaded for this session!", "confidence_score": 0}
 
     session_data["last_accessed"] = time.time()
     vectorstore = session_data["vectorstore"]
@@ -232,7 +303,7 @@ def ask_question(request: Request, data: AskRequest):
     )
 
     answer = normalize_answer(raw_answer)
-    return {"answer": answer}
+    return {"answer": answer, "confidence_score": confidence}
 
 
 @app.post("/summarize")
@@ -240,16 +311,17 @@ def ask_question(request: Request, data: AskRequest):
 def summarize_pdf(request: Request, data: SummarizeRequest):
     cleanup_expired_sessions()
 
-    session_data = sessions.get(data.session_id)
-    if not session_data:
-        return {"summary": "Session expired or no PDF uploaded for this session!"}
+    session = sessions.get(data.session_id)
+    if not session:
+        return {"summary": "Session expired or PDF not uploaded"}
 
-    session_data["last_accessed"] = time.time()
-    vectorstore = session_data["vectorstore"]
+    session["last_accessed"] = time.time()
+    vectorstore = session["vectorstore"]
 
-    docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
+
+    docs = vectorstore.similarity_search("Summarize the document.", k=6)
     if not docs:
-        return {"summary": "No document context available to summarize."}
+        return {"summary": "No content available"}
 
     context = "\n\n".join([doc.page_content for doc in docs])
 
@@ -274,5 +346,8 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     return {"summary": summary}
 
 
+# -------------------------------------------------------------------
+# START SERVER
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
