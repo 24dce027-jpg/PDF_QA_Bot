@@ -2,180 +2,243 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
-const fs = require("fs");
+const axiosRetry = require("axios-retry").default;
 const path = require("path");
+const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
+const { fileTypeFromFile } = require("file-type");
+const fs = require("fs");
 const session = require("express-session");
+require("dotenv").config();
 
 const app = express();
+
+// ------------------------------------------------------------------
+// CONFIGURATION
+// ------------------------------------------------------------------
+const API_REQUEST_TIMEOUT = parseInt(
+  process.env.API_REQUEST_TIMEOUT || "45000",
+  10
+);
+
+const MAX_RETRY_ATTEMPTS = parseInt(
+  process.env.MAX_RETRY_ATTEMPTS || "3",
+  10
+);
+
+// ------------------------------------------------------------------
+// APP SETUP
+// ------------------------------------------------------------------
+app.set("trust proxy", 1);
 app.use(cors());
-app.set('trust proxy', 1); // Fix ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
 app.use(express.json());
 
-// Session middleware for per-user chat history
-app.use(session({
-  secret: "pdf-qa-bot-secret-key",
-  resave: false,
-  saveUninitialized: true,
-  cookie: { 
-    secure: false,
-    maxAge: 1000 * 60 * 60 * 24 // 24 hours
-  }
-}));
+// ------------------------------------------------------------------
+// SESSION (per-user chat history)
+// ------------------------------------------------------------------
+app.use(
+  session({
+    secret: "pdf-qa-bot-secret-key",
+    resave: false,
+    saveUninitialized: true,
+    cookie: {
+      secure: false,
+      maxAge: 1000 * 60 * 60 * 24,
+    },
+  })
+);
 
-// Rate limiting middleware
+// ------------------------------------------------------------------
+// AXIOS RETRY CONFIG
+// ------------------------------------------------------------------
+axiosRetry(axios, {
+  retries: MAX_RETRY_ATTEMPTS,
+  retryDelay: axiosRetry.exponentialDelay,
+  retryCondition: (error) =>
+    axiosRetry.isNetworkOrIdempotentRequestError(error) ||
+    error.code === "ECONNABORTED" ||
+    (error.response && error.response.status >= 500),
+});
+
+// ------------------------------------------------------------------
+// RATE LIMITERS
+// ------------------------------------------------------------------
 const uploadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  message: "Too many PDF uploads from this IP, please try again after 15 minutes",
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
 });
 
 const askLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
-  message: "Too many questions asked, please try again after 15 minutes",
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
 });
 
 const summarizeLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
-  message: "Too many summarization requests, please try again after 15 minutes",
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
 });
 
-// Storage for uploaded PDFs
-const upload = multer({ dest: "uploads/" });
+const compareLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+});
 
-// Route: Upload PDF
+// ------------------------------------------------------------------
+// FILE STORAGE
+// ------------------------------------------------------------------
+const UPLOAD_DIR = path.resolve(__dirname, "uploads");
+
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR);
+}
+
+// ------------------------------------------------------------------
+// MULTER CONFIG
+// ------------------------------------------------------------------
+const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
+
+const storage = multer.diskStorage({
+  destination: "uploads/",
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const uniqueName = `${Date.now()}-${Math.round(
+      Math.random() * 1e9
+    )}${ext}`;
+    cb(null, uniqueName);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (SUPPORTED_EXTENSIONS.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Unsupported file type"));
+    }
+  },
+});
+
+// ------------------------------------------------------------------
+// ROUTE: UPLOAD
+// ------------------------------------------------------------------
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
+      return res.status(400).json({
+        error: "No file uploaded. Use form field name 'file'.",
+      });
     }
 
-    const filePath = path.join(__dirname, req.file.path);
-
-    // Generate or get session ID for this user
-    if (!req.session.sessionId) {
-      const crypto = require("crypto");
-      req.session.sessionId = crypto.randomUUID();
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId." });
     }
 
-    // Clear chat history when uploading new PDF
+    // **CRITICAL**: Clear session and reset backend state before processing new PDF
+    // This prevents cross-document context leakage
     if (req.session) {
       req.session.chatHistory = [];
+      req.session.currentPdfSessionId = null;
     }
 
-    // Send PDF to Python service with session ID in headers
-    const uploadResponse = await axios.post(
-      "http://localhost:5000/process-pdf",
-      { filePath: filePath },
-      {
-        headers: {
-          "X-Session-ID": req.session.sessionId
-        }
-      }
-    );
+    // Reset backend state through the /reset endpoint
+    try {
+      await axios.post("http://localhost:5000/reset");
+    } catch (resetError) {
+      console.warn("Warning: Could not reset backend state:", resetError.message);
+      // Continue with PDF upload even if reset fails
+    }
+
+    // Send PDF to Python service for processing
+    const uploadResponse = await axios.post("http://localhost:5000/process-pdf", {
+      filePath: filePath,
+    });
+
+    // Store the new PDF session ID for future validation
+    if (uploadResponse.data.session_id && req.session) {
+      req.session.currentPdfSessionId = uploadResponse.data.session_id;
+    }
 
     res.json({
       message: "PDF uploaded & processed successfully!",
-      session_id: req.session.sessionId,
+      session_id: uploadResponse.data.session_id,
       details: uploadResponse.data
     });
   } catch (err) {
-    const details = err.response?.data || err.message;
-    console.error("Upload processing failed:", details);
-    res.status(500).json({ error: "PDF processing failed", details });
+    console.error("Upload failed:", err.message);
+    res.status(500).json({ error: "Upload failed" });
   }
 });
 
-// Route: Ask Question
+// ------------------------------------------------------------------
+// ROUTE: ASK
+// ------------------------------------------------------------------
 app.post("/ask", askLimiter, async (req, res) => {
+  const { question, sessionId } = req.body;
+
+  if (!sessionId)
+    return res.status(400).json({ error: "Missing sessionId." });
+
+  if (!question || typeof question !== "string" || !question.trim())
+    return res.status(400).json({ error: "Invalid question." });
+
   try {
-    const question = req.body.question;
-    
-    // Initialize session chat history if it doesn't exist
     if (!req.session.chatHistory) {
       req.session.chatHistory = [];
     }
 
-    // Add user message to session history
     req.session.chatHistory.push({
       role: "user",
-      content: question
+      content: question.trim(),
     });
 
-    // Ensure session ID exists
-    if (!req.session.sessionId) {
-      const crypto = require("crypto");
-      req.session.sessionId = crypto.randomUUID();
-    }
-
-    // Send question to FastAPI with session ID in headers
     const response = await axios.post(
       "http://localhost:5000/ask",
       {
-        question: question,
-        history: req.session.chatHistory
+        question: question.trim(),
+        session_id: sessionId,
+        history: req.session.chatHistory,
       },
-      {
-        headers: {
-          "X-Session-ID": req.session.sessionId
-        }
-      }
+      { timeout: API_REQUEST_TIMEOUT }
     );
 
-    // Add assistant response to session history
     req.session.chatHistory.push({
       role: "assistant",
-      content: response.data.answer
+      content: response.data.answer,
     });
 
     res.json(response.data);
-
   } catch (error) {
-    console.error(error.message);
+    console.error("Ask failed:", error.message);
     res.status(500).json({ error: "Error asking question" });
   }
 });
 
+// ------------------------------------------------------------------
+// ROUTE: CLEAR HISTORY
+// ------------------------------------------------------------------
 app.post("/clear-history", (req, res) => {
-  // Clear only this user's session history
   if (req.session) {
     req.session.chatHistory = [];
+    req.session.currentPdfSessionId = null;
   }
   res.json({ message: "Chat history cleared" });
 });
 
 app.get("/pdf-status", async (req, res) => {
   try {
-    // Ensure session ID exists
-    if (!req.session.sessionId) {
-      const crypto = require("crypto");
-      req.session.sessionId = crypto.randomUUID();
-    }
-
     // Check backend PDF status
-    const statusResponse = await axios.get("http://localhost:5000/status", {
-      headers: {
-        "X-Session-ID": req.session.sessionId
-      }
-    });
+    const statusResponse = await axios.get("http://localhost:5000/status");
     
     // Include frontend session status
     const frontendStatus = {
       hasSession: !!req.session,
       hasHistory: req.session?.chatHistory?.length > 0 || false,
       historyLength: req.session?.chatHistory?.length || 0,
-      sessionId: req.session?.sessionId || null
+      currentSessionId: req.session?.currentPdfSessionId || null
     };
 
     res.json({
@@ -188,58 +251,64 @@ app.get("/pdf-status", async (req, res) => {
   }
 });
 
-app.post("/compare", async (req, res) => {
-  try {
-    const { question, session_id_1, session_id_2 } = req.body;
-    
-    // Use provided session IDs or current session
-    const id1 = session_id_1 || req.session?.sessionId;
-    const id2 = session_id_2 || req.session?.sessionId;
-    
-    if (!id1 || !id2) {
-      return res.status(400).json({ error: "Session IDs required for comparison" });
-    }
-
-    const response = await axios.post(
-      "http://localhost:5000/compare",
-      {
-        session_id_1: id1,
-        session_id_2: id2,
-        question: question || "Compare these documents"
-      }
-    );
-
-    res.json(response.data);
-  } catch (err) {
-    const details = err.response?.data || err.message;
-    console.error("Comparison failed:", details);
-    res.status(500).json({ error: "Error comparing PDFs", details });
-  }
-});
-
+// ------------------------------------------------------------------
+// ROUTE: SUMMARIZE
+// ------------------------------------------------------------------
 app.post("/summarize", summarizeLimiter, async (req, res) => {
-  try {
-    // Ensure session ID exists
-    if (!req.session.sessionId) {
-      const crypto = require("crypto");
-      req.session.sessionId = crypto.randomUUID();
-    }
+  const { sessionId } = req.body;
 
+  if (!sessionId)
+    return res.status(400).json({ error: "Missing sessionId." });
+
+  try {
     const response = await axios.post(
       "http://localhost:5000/summarize",
-      req.body || {},
-      {
-        headers: {
-          "X-Session-ID": req.session.sessionId
-        }
-      }
+      { session_id: sessionId },
+      { timeout: API_REQUEST_TIMEOUT }
     );
+
     res.json({ summary: response.data.summary });
   } catch (err) {
-    const details = err.response?.data || err.message;
-    console.error("Summarization failed:", details);
-    res.status(500).json({ error: "Error summarizing PDF", details });
+    if (err.code === "ECONNABORTED") {
+      return res.status(504).json({ error: "Summarization timed out" });
+    }
+    res.status(500).json({ error: "Error summarizing" });
   }
 });
 
-app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
+// ------------------------------------------------------------------
+// ROUTE: COMPARE
+// ------------------------------------------------------------------
+app.post("/compare", compareLimiter, async (req, res) => {
+  try {
+    const response = await axios.post(
+      "http://localhost:5000/compare",
+      req.body,
+      { timeout: API_REQUEST_TIMEOUT }
+    );
+
+    res.json({ comparison: response.data.comparison });
+  } catch (err) {
+    res.status(500).json({ error: "Error comparing" });
+  }
+});
+
+// ------------------------------------------------------------------
+// ERROR HANDLING
+// ------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  if (err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({
+      error: "File too large (max 20MB).",
+    });
+  }
+  if (err.message.includes("Unsupported file type")) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
+});
+
+// ------------------------------------------------------------------
+app.listen(4000, () =>
+  console.log("Backend running on http://localhost:4000")
+);

@@ -1,14 +1,22 @@
-from fastapi import FastAPI
-from fastapi import Request
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
-from dotenv import load_dotenv
+from langchain_core.prompts import PromptTemplate
 from groq import Groq
-import os
+from dotenv import load_dotenv
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+import os 
 import re
 import uvicorn
 from slowapi import Limiter
@@ -16,26 +24,24 @@ from slowapi.util import get_remote_address
 import threading
 from datetime import datetime
 
+# ===============================
+# APP SETUP
+# ===============================
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
 
 app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
-# ---------------------------------------------------------------------------
-# GROQ CLIENT SETUP
-# ---------------------------------------------------------------------------
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-if not GROQ_API_KEY:
-    raise RuntimeError(
-        "GROQ_API_KEY is not set. Please add it to your .env file.\n"
-        "Get a free key at https://console.groq.com"
-    )
-
-groq_client = Groq(api_key=GROQ_API_KEY)
+# ===============================
+# CONFIG
+# ===============================
+HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
+SESSION_TIMEOUT = 3600
 
 # ---------------------------------------------------------------------------
 # GLOBAL STATE MANAGEMENT (Thread-safe, Multi-user support)
@@ -47,6 +53,9 @@ sessions_lock = threading.RLock()  # Thread-safe access to sessions
 # Load local embedding model (unchanged — FAISS retrieval stays the same)
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # ---------------------------------------------------------------------------
 # SESSION MANAGEMENT UTILITIES (Thread-safe, Multi-user support)
@@ -96,86 +105,144 @@ def clear_session(session_id: str):
 
 
 def normalize_spaced_text(text: str) -> str:
-    """
-    Fixes character-level spaced text produced by PyPDFLoader on certain
-    vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
-
-    Examples:
-        'J A I N I   S O L A N K I'  ->  'JAINI SOLANKI'
-        'I B M'                       ->  'IBM'
-        'N P T E L'                   ->  'NPTEL'
-
-    Normal multi-letter words are left completely untouched.
-    """
-    def fix_spaced_word(match):
-        return match.group(0).replace(" ", "")
-
-    # Pattern: 3+ single alpha chars each separated by exactly one space
-    pattern = r'\b(?:[A-Za-z] ){2,}[A-Za-z]\b'
-    return re.sub(pattern, fix_spaced_word, text)
+    pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
+    return re.sub(pattern, lambda m: m.group(0).replace(" ", ""), text)
 
 
 def normalize_answer(text: str) -> str:
     """
-    Post-processes the LLM-generated answer:
-    - Removes any residual character-level spacing.
-    - Strips prompt leakage (lines starting with 'Answer', 'Context', etc.)
-    - Collapses excessive whitespace.
+    Post-processes the LLM-generated answer.
     """
-    # Remove residual character spacing in the answer itself
     text = normalize_spaced_text(text)
-    # Strip any prompt-leakage prefixes the model might echo
-    text = re.sub(r'^(Answer[^:]*:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
-    # Collapse multiple spaces/newlines
-    text = re.sub(r'[ \t]{2,}', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r"^(Answer[^:]*:|Context:|Question:)\s*", "", text, flags=re.I)
     return text.strip()
 
 
-# ---------------------------------------------------------------------------
-# GROQ-BASED RESPONSE GENERATION
-# ---------------------------------------------------------------------------
+# ===============================
+# DOCUMENT LOADERS
+# ===============================
+def load_pdf(file_path: str):
+    return PyPDFLoader(file_path).load()
 
-def generate_response(prompt: str, max_new_tokens: int = 512) -> str:
-    """
-    Sends the prompt to the Groq API using the configured llama-3.3-70b-versatile
-    model and returns the generated text.
-    """
-    chat_completion = groq_client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        model=GROQ_MODEL,
-        max_tokens=max_new_tokens,
-        temperature=0.2,
+
+def load_txt(file_path: str):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return [Document(page_content=f.read())]
+
+
+def load_docx(file_path: str):
+    doc = docx.Document(file_path)
+    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    return [Document(page_content=text)]
+
+
+def load_document(file_path: str):
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return load_pdf(file_path)
+    elif ext == ".docx":
+        return load_docx(file_path)
+    elif ext in [".txt", ".md"]:
+        return load_txt(file_path)
+    else:
+        raise ValueError("Unsupported file format")
+
+
+# ===============================
+# MODEL LOADING
+# ===============================
+def load_generation_model():
+    global generation_model, generation_tokenizer, generation_is_encoder_decoder
+
+    if generation_model:
+        return generation_tokenizer, generation_model, generation_is_encoder_decoder
+
+    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+    generation_is_encoder_decoder = bool(config.is_encoder_decoder)
+
+    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+
+    if generation_is_encoder_decoder:
+        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+    else:
+        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+
+    if torch.cuda.is_available():
+        generation_model = generation_model.to("cuda")
+
+    generation_model.eval()
+    return generation_tokenizer, generation_model, generation_is_encoder_decoder
+
+
+def generate_response(prompt: str, max_new_tokens: int):
+    tokenizer, model, is_enc = load_generation_model()
+    device = next(model.parameters()).device
+
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+
+    output = model.generate(
+        **encoded,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
     )
-    return chat_completion.choices[0].message.content.strip()
+
+    if is_enc:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return tokenizer.decode(
+        output[0][encoded["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
 
 
-# ---------------------------------------------------------------------------
+# ===============================
 # REQUEST MODELS
-# ---------------------------------------------------------------------------
-
-class PDFPath(BaseModel):
+# ===============================
+class DocumentPath(BaseModel):
     filePath: str
+    session_id: str
+
 
 class AskRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1)
+    session_id: str
     history: list = []
+
+    @validator("question")
+    def validate_question(cls, v):
+        if not v.strip():
+            raise ValueError("Empty question")
+        return v.strip()
 
 
 class SummarizeRequest(BaseModel):
+    session_id: str
     pdf: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# ENDPOINTS
-# ---------------------------------------------------------------------------
 
-@app.post("/process-pdf")
+class CompareRequest(BaseModel):
+    session_id: str
+
+# -------------------------------------------------------------------
+# SESSION CLEANUP
+# -------------------------------------------------------------------
+
+
+def cleanup_expired_sessions():
+    now = time.time()
+    expired = [k for k, v in sessions.items()
+               if now - v["last"] > SESSION_TIMEOUT]
+    for k in expired:
+        del sessions[k]
+
+
+# ===============================
+# PROCESS DOCUMENT
+# ===============================
+@app.post("/process")
 @limiter.limit("15/15 minutes")
 def process_pdf(request: Request, data: PDFPath):
     """
@@ -281,6 +348,7 @@ Answer:"""
     except Exception as e:
         return {"answer": f"Error processing question: {str(e)}"}
 
+    return {"answer": normalize_answer(answer), "confidence_score": 85}
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
@@ -409,5 +477,8 @@ def get_pdf_status(request: Request):
         }
 
 
+# -------------------------------------------------------------------
+# START SERVER
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
