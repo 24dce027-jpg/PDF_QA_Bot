@@ -10,7 +10,7 @@ import {
   Form,
   Card,
   Spinner,
-  Navbar,
+  Navbar
 } from "react-bootstrap";
 import { Document, Page, pdfjs } from "react-pdf";
 
@@ -29,6 +29,7 @@ function App() {
   const [chatHistory, setChatHistory] = useState([]);
   const [comparisonResult, setComparisonResult] = useState(null);
   const [question, setQuestion] = useState("");
+
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
@@ -87,6 +88,7 @@ function App() {
           doc_id: res.data.doc_id,
           session_id: res.data.session_id,
           url,
+          session_id: res.data.session_id, // REQUIRED: keep sessionId
         },
       ]);
 
@@ -97,6 +99,7 @@ function App() {
     }
 
     setUploading(false);
+    setProcessingPdf(false);
   };
 
   // ===============================
@@ -118,6 +121,7 @@ function App() {
     if (!question.trim() || selectedSessions.length === 0) return;
 
     setChatHistory((prev) => [...prev, { role: "user", text: question }]);
+    const q = question;
     setQuestion("");
     setAsking(true);
 
@@ -148,6 +152,7 @@ function App() {
     if (selectedSessions.length === 0) return;
 
     setSummarizing(true);
+
     try {
       const res = await axios.post(`${API_BASE}/summarize`, {
         session_ids: selectedSessions,
@@ -171,6 +176,7 @@ function App() {
     if (selectedSessions.length < 2) return;
 
     setComparing(true);
+
     try {
       const res = await axios.post(`${API_BASE}/compare`, {
         session_ids: selectedSessions,
