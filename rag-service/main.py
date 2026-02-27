@@ -161,23 +161,29 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         loader = PyPDFLoader(file_path)
         docs = loader.load()
 
-        # Check if the PDF has extractable text
-        total_text_length = sum(len(doc.page_content.strip()) for doc in docs)
+        # Check if each page has extractable text
+        final_docs = []
+        images = None
         
-        if total_text_length < 50:
-            # Fallback to OCR if text length is very low (likely a scanned PDF)
-            print("Low text content detected. Falling back to OCR...")
-            images = pdf2image.convert_from_path(file_path)
-            ocr_docs = []
-            for i, image in enumerate(images):
-                # Extract text using Tesseract
-                ocr_text = pytesseract.image_to_string(image)
-                # Create a Langchain Document
-                ocr_docs.append(Document(
-                    page_content=ocr_text,
-                    metadata={"source": file_path, "page": i}
-                ))
-            docs = ocr_docs
+        for i, doc in enumerate(docs):
+            if len(doc.page_content.strip()) < 50:
+                # Fallback to OCR for this specific page
+                if images is None:
+                    print("Low text content detected on one or more pages. Falling back to OCR...")
+                    images = pdf2image.convert_from_path(file_path)
+                
+                if i < len(images):
+                    ocr_text = pytesseract.image_to_string(images[i])
+                    final_docs.append(Document(
+                        page_content=ocr_text,
+                        metadata={"source": file_path, "page": i}
+                    ))
+                else:
+                    final_docs.append(doc)
+            else:
+                final_docs.append(doc)
+
+        docs = final_docs
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
