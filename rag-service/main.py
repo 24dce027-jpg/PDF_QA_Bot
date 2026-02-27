@@ -17,6 +17,9 @@ import time
 import uuid
 import torch
 import uvicorn
+import pdf2image
+import pytesseract
+from PIL import Image
 
 # Post-processing helpers: strip prompt echoes / context leakage from LLM output
 # so that the API always returns only the clean, user-facing answer/summary/comparison.
@@ -162,11 +165,38 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         loader = PyPDFLoader(file_path)
         docs = loader.load()
 
+        # Check if each page has extractable text
+        final_docs = []
+        images = None
+        
+        for i, doc in enumerate(docs):
+            if len(doc.page_content.strip()) < 50:
+                # Fallback to OCR for this specific page
+                if images is None:
+                    print("Low text content detected on one or more pages. Falling back to OCR...")
+                    images = pdf2image.convert_from_path(file_path)
+                
+                if i < len(images):
+                    ocr_text = pytesseract.image_to_string(images[i])
+                    final_docs.append(Document(
+                        page_content=ocr_text,
+                        metadata={"source": file_path, "page": i}
+                    ))
+                else:
+                    final_docs.append(doc)
+            else:
+                final_docs.append(doc)
+
+        docs = final_docs
+
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=100
         )
         chunks = splitter.split_documents(docs)
+
+        if not chunks:
+            return {"error": "Upload failed: No extractable text found in the document (OCR yielded nothing)."}
 
         vectorstore = FAISS.from_documents(chunks, embedding_model)
 
