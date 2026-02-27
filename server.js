@@ -4,8 +4,23 @@ const multer = require("multer");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const rateLimit = require("express-rate-limit");
+const session = require("express-session");
+require("dotenv").config();
 
-const app = express();
+const app = express(); // FIX: removed duplicate declaration
+
+
+const PORT = process.env.PORT || 4000;
+const RAG_URL = process.env.RAG_SERVICE_URL || "http://localhost:5000";
+const SESSION_SECRET = process.env.SESSION_SECRET; // FIX: removed hardcoded secret
+
+if (!SESSION_SECRET) {
+  throw new Error("SESSION_SECRET must be set in environment variables");
+}
+
+
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
@@ -34,6 +49,15 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
     }
+    throw new Error("RAG unhealthy");
+  } catch (error) {
+    return res.status(503).json({
+      status: "not ready",
+      service: "pdf-qa-gateway",
+      dependencies: { rag_service: "unreachable" },
+    });
+  }
+});
 
     // Build absolute file path
     filePath = path.join(__dirname, req.file.path);
@@ -87,32 +111,97 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const details = err.response?.data || err.message;
     console.error("Upload processing failed:", details);
     res.status(500).json({ error: "PDF processing failed", details });
-  }
-});
+    const filePath = path.resolve(req.file.path);
 
-// Route: Ask Question
-app.post("/ask", async (req, res) => {
-  const { question } = req.body;
-  try {
-    const response = await axios.post("http://localhost:5000/ask", {
-      question,
+    const response = await axios.post(
+      `${RAG_URL}/upload`,
+      formData.append("file", fileStream),
+      {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: 180000,
+      }
+    );
+
+    // Store sessionId returned from FastAPI
+    if (req.session) {
+      req.session.currentSessionId = response.data.session_id;
+      req.session.chatHistory = [];
+    }
+
+    return res.json({
+      message: response.data.message,
+      session_id: response.data.session_id,
     });
-
-    res.json({ answer: response.data.answer });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: "Error answering question" });
+    console.error("[/upload]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Upload failed." });
   }
 });
 
-app.post("/summarize", async (req, res) => {
+
+app.post("/ask", askLimiter, async (req, res) => {
+  const { question, session_ids } = req.body;
+
+  if (!question) return res.status(400).json({ error: "Missing question." });
+  if (!session_ids || session_ids.length === 0) {
+    return res.status(400).json({ error: "Missing session_ids." });
+  }
+
   try {
-    const response = await axios.post("http://localhost:5000/summarize", req.body || {});
-    res.json({ summary: response.data.summary });
+    const response = await axios.post(
+      `${RAG_URL}/ask`,
+      { question, session_ids },
+      { timeout: 180000 }
+    );
+
+    return res.json(response.data);
+  } catch (error) {
+    console.error("[/ask]", error.response?.data || error.message);
+    return res.status(500).json({ error: "Error getting answer." });
+  }
+});
+
+
+app.post("/summarize", summarizeLimiter, async (req, res) => {
+  const { session_ids } = req.body;
+
+  if (!session_ids || session_ids.length === 0) {
+    return res.status(400).json({ error: "Missing session_ids." });
+  }
+
+  try {
+    const response = await axios.post(
+      `${RAG_URL}/summarize`,
+      { session_ids },
+      { timeout: 180000 }
+    );
+
+    return res.json(response.data);
   } catch (err) {
-    const details = err.response?.data || err.message;
-    console.error("Summarization failed:", details);
-    res.status(500).json({ error: "Error summarizing PDF", details });
+    console.error("[/summarize]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Error summarizing PDF." });
+  }
+});
+
+
+app.post("/compare", compareLimiter, async (req, res) => {
+  const { session_ids } = req.body;
+
+  if (!session_ids || session_ids.length < 2) {
+    return res.status(400).json({ error: "Select at least 2 documents." });
+  }
+
+  try {
+    const response = await axios.post(
+      `${RAG_URL}/compare`,
+      { session_ids },
+      { timeout: 180000 }
+    );
+
+    return res.json(response.data);
+  } catch (err) {
+    console.error("[/compare]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Error comparing documents." });
   }
 });
 
@@ -146,3 +235,11 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+app.listen(PORT, () =>
+  console.log(`Backend running on http://localhost:${PORT}`)
+);
