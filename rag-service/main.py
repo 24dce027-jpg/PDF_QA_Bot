@@ -97,6 +97,7 @@ model.eval()
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     session_ids: list = []
+    history: list = []
 
 
 class SummarizeRequest(BaseModel):
@@ -179,36 +180,47 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
-
-        # Check if each page has extractable text
-        final_docs = []
-        images = None
-        
-        for i, doc in enumerate(docs):
-            if len(doc.page_content.strip()) < 50:
-                # Fallback to OCR for this specific page
-                if images is None:
-                    print("Low text content detected on one or more pages. Falling back to OCR...")
-                    images = pdf2image.convert_from_path(file_path)
-                
-                if i < len(images):
-                    ocr_text = pytesseract.image_to_string(images[i])
-                    final_docs.append(Document(
-                        page_content=ocr_text,
-                        metadata={"source": file_path, "page": i}
-                    ))
+        try:
+            from utils.layout_extractor import extract_layout_aware_text
+            docs = extract_layout_aware_text(file_path)
+            
+            # Since layout extractor doesn't explicitly return original page count matching strictly OCR,
+            # we infer page count from metadata.
+            page_count = max([doc.metadata.get("page", 0) for doc in docs]) + 1 if docs else 0
+        except Exception as layout_e:
+            print(f"Layout extractor failed, falling back to PyPDFLoader: {layout_e}")
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            page_count = len(docs)
+    
+            # Check if each page has extractable text
+            final_docs = []
+            images = None
+            
+            for i, doc in enumerate(docs):
+                if len(doc.page_content.strip()) < 50:
+                    # Fallback to OCR for this specific page
+                    if images is None:
+                        print("Low text content detected on one or more pages. Falling back to OCR...")
+                        images = pdf2image.convert_from_path(file_path)
+                    
+                    if i < len(images):
+                        ocr_text = pytesseract.image_to_string(images[i])
+                        final_docs.append(Document(
+                            page_content=ocr_text,
+                            metadata={"source": file_path, "page": i}
+                        ))
+                    else:
+                        final_docs.append(doc)
                 else:
                     final_docs.append(doc)
-            else:
-                final_docs.append(doc)
-
-        docs = final_docs
+    
+            docs = final_docs
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100
+            chunk_size=512,
+            chunk_overlap=64,
+            separators=["\n\n", "\n", ". ", " "]
         )
         chunks = splitter.split_documents(docs)
 
@@ -226,7 +238,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         return {
             "message": "PDF uploaded and processed",
             "session_id": session_id,
-            "page_count": len(docs)
+            "page_count": page_count
         }
 
     except Exception as e:
@@ -263,7 +275,11 @@ def ask_question(request: Request, data: AskRequest):
         if session:
             session["last_accessed"] = time.time()
 
-    vectorstores = get_session_docs(data.session_id, data.doc_ids)
+    vectorstores = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vectorstores.extend(session["vectorstores"])
     if not vectorstores:
         return {"answer": "No documents found for the selected session."}
 
@@ -281,10 +297,6 @@ def ask_question(request: Request, data: AskRequest):
     # e.g. "What is the percentage?" → appends "percentage % score marks grade"
     expanded_query = expand_query(question)
 
-    # Retrieve a larger candidate pool (k=8) so re-ranking has more to work with
-    docs = merged_similarity_search(vectorstores, expanded_query, k=8)
-    if not docs:
-        return {"answer": "No relevant context found in the selected documents."}
     # Gather retrieved docs with their session filenames
     docs_with_meta = []
     for sid in data.session_ids:
@@ -292,7 +304,8 @@ def ask_question(request: Request, data: AskRequest):
         if session:
             vs = session["vectorstores"][0]
             filename = session.get("filename", "unknown")
-            retrieved = vs.similarity_search(data.question, k=4)
+            # Retrieve a larger candidate pool (k=8) so re-ranking has more to work with
+            retrieved = vs.similarity_search(expanded_query, k=8)
             for doc in retrieved:
                 docs_with_meta.append({
                     "doc": doc,
@@ -314,7 +327,8 @@ def ask_question(request: Request, data: AskRequest):
     # ── Step 2: Re-rank chunks by answer-type relevance ───────────────────────
     # Promotes chunks whose content FORMAT matches what the question asks for
     # (e.g. chunk with "69%" ranked above chunk with "45/75" for a % question).
-    docs = rerank_docs(docs, question, top_k=4)
+    docs_to_rerank = [item["doc"] for item in docs_with_meta]
+    docs = rerank_docs(docs_to_rerank, question, top_k=4)
 
     context = "\n\n".join([doc.page_content for doc in docs])
 
@@ -343,7 +357,9 @@ def ask_question(request: Request, data: AskRequest):
     # Build deduplicated, sorted citations
     seen = set()
     citations = []
-    for item in docs_with_meta:
+    # Filter citations to only matched docs that survived reranking
+    final_docs_with_meta = [item for item in docs_with_meta if item["doc"] in docs]
+    for item in final_docs_with_meta:
         raw_page = item["doc"].metadata.get("page", 0)
         page_num = int(raw_page) + 1
         key = (item["filename"], page_num)

@@ -13,21 +13,14 @@ const app = express(); // FIX: removed duplicate declaration
 
 const PORT = process.env.PORT || 4000;
 const RAG_URL = process.env.RAG_SERVICE_URL || "http://localhost:5000";
-const SESSION_SECRET = process.env.SESSION_SECRET; // FIX: removed hardcoded secret
-
-if (!SESSION_SECRET) {
-  throw new Error("SESSION_SECRET must be set in environment variables");
-}
-
 
 app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-
 app.use(
   session({
-    secret: SESSION_SECRET,
+    secret: "fallback_session_secret_key", // FIX: removed SESSION_SECRET environment variable dependency
     resave: false,
     saveUninitialized: true,
     cookie: {
@@ -173,7 +166,7 @@ app.post("/ask", askLimiter, async (req, res) => {
     // Send question + history to FastAPI with session isolation
     const response = await axios.post("http://localhost:5000/ask", {
       question: question,
-      session_id: sessionId,
+      session_ids: session_ids,
       history: req.session.chatHistory,
     });
 
