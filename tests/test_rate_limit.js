@@ -1,13 +1,22 @@
 const axios = require('axios');
 
-const API_BASE = 'http://localhost:4000';
+// Configuration constants
+const API_BASE = process.env.API_BASE || 'http://localhost:4000';
+const ASK_RATE_LIMIT = 20;
+const TEST_REQUEST_COUNT = ASK_RATE_LIMIT + 1; // Send one more than limit to trigger 429
 
+/**
+ * Tests the /ask endpoint rate limiter
+ * Sends more requests than the limit allows and verifies rate limiting kicks in
+ * @async
+ * @returns {Promise<void>}
+ */
 async function testAskLimiter() {
-    console.log('Testing /ask rate limiter (Limit: 20/min)...');
+    console.log(`Testing /ask rate limiter (Limit: ${ASK_RATE_LIMIT}/min)...`);
 
     const requests = [];
-    // Send 21 requests to /ask
-    for (let i = 1; i <= 21; i++) {
+    // Send more requests than the limit allows
+    for (let i = 1; i <= TEST_REQUEST_COUNT; i++) {
         requests.push(
             axios.post(`${API_BASE}/ask`, { question: 'test' })
                 .then(res => ({ status: res.status, i: i, data: res.data }))

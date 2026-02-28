@@ -4,7 +4,13 @@ import { uploadDocument } from "../services/api";
 
 /**
  * DocumentUploader component
- * Handles file input and upload with error handling
+ * Handles file input and upload with proper error handling and user feedback
+ * @param {Object} props - Component props
+ * @param {Function} props.onUploadSuccess - Callback triggered after successful upload
+ * @param {string} props.sessionId - Current session ID
+ * @param {boolean} props.darkMode - Dark mode enabled state
+ * @param {string} props.cardClass - CSS class for card styling
+ * @param {string} props.inputClass - CSS class for input styling
  */
 const DocumentUploader = ({ onUploadSuccess, sessionId, darkMode, cardClass, inputClass }) => {
   const [file, setFile] = useState(null);
@@ -23,7 +29,8 @@ const DocumentUploader = ({ onUploadSuccess, sessionId, darkMode, cardClass, inp
       setFile(null);
       alert("Document uploaded successfully!");
     } catch (error) {
-      alert(error.message);
+      console.error("Document upload error:", error.message);
+      alert(error.message || "Upload failed. Please try again.");
     } finally {
       setUploading(false);
     }

@@ -3,7 +3,13 @@ import { Card, Form } from "react-bootstrap";
 
 /**
  * DocumentSelector component
- * Displays a checklist for selecting documents
+ * Displays a checklist for selecting documents for Q&A operations
+ * @param {Object} props - Component props
+ * @param {Array} props.documents - Array of document objects with doc_id and name
+ * @param {Array} props.selectedDocIds - Array of currently selected document IDs
+ * @param {Function} props.onSelectionChange - Callback when document selection changes
+ * @param {string} props.cardClass - CSS class for card styling
+ * @returns {JSX.Element|null} Document selector component or null if no documents
  */
 const DocumentSelector = ({
   documents,

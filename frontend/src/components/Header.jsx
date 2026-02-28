@@ -2,7 +2,11 @@ import React from "react";
 import { Navbar, Container, Button } from "react-bootstrap";
 
 /**
- * Header component - Displays navbar with title and theme toggle
+ * Header component
+ * Displays navigation bar with title and theme toggle button
+ * @param {Object} props - Component props
+ * @param {boolean} props.darkMode - Current dark mode state
+ * @param {Function} props.onThemeToggle - Callback for theme toggle
  */
 const Header = ({ darkMode, onThemeToggle }) => {
   return (

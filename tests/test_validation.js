@@ -3,15 +3,26 @@ const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 
-const API_BASE = 'http://localhost:4000';
+// Configuration constants
+const API_BASE = process.env.API_BASE || 'http://localhost:4000';
+const MAX_FILE_SIZE_MB = 20;
+const EXPECTED_PDF_HEADER = '%PDF-1.4';
+const EXPECTED_ERROR_INVALID_TYPE = 'Invalid file type. Only PDF files are accepted.';
+const EXPECTED_ERROR_FILE_SIZE = `File too large. Maximum allowed size is ${MAX_FILE_SIZE_MB}MB.`;
 
+/**
+ * Tests file upload validation on the backend
+ * Validates PDF files, file sizes, and extension spoofing protection
+ * @async
+ * @returns {Promise<void>}
+ */
 async function testValidation() {
     console.log('--- Testing File Validation ---');
 
     // 1. Test valid PDF (assuming we have one or create a dummy)
     console.log('\nTesting valid PDF upload...');
     const dummyPdfPath = path.join(__dirname, 'test_dummy.pdf');
-    fs.writeFileSync(dummyPdfPath, '%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF');
+    fs.writeFileSync(dummyPdfPath, `${EXPECTED_PDF_HEADER}\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF`);
 
     try {
         const form = new FormData();
@@ -37,7 +48,7 @@ async function testValidation() {
         });
         console.log('❌ Invalid extension: Failed to catch!');
     } catch (err) {
-        if (err.response?.status === 400 && err.response?.data?.error === 'Invalid file type. Only PDF files are accepted.') {
+        if (err.response?.status === 400 && err.response?.data?.error === EXPECTED_ERROR_INVALID_TYPE) {
             console.log('✅ Invalid extension: Caught correctly (Status 400)');
         } else {
             console.log('❌ Invalid extension: Unexpected response (Status', err.response?.status, ')');
@@ -57,7 +68,7 @@ async function testValidation() {
         });
         console.log('❌ Spoofed extension: Failed to catch!');
     } catch (err) {
-        if (err.response?.status === 400 && err.response?.data?.error === 'Invalid file type. Only PDF files are accepted.') {
+        if (err.response?.status === 400 && err.response?.data?.error === EXPECTED_ERROR_INVALID_TYPE) {
             console.log('✅ Spoofed extension: Caught correctly (Status 400)');
         } else {
             console.log('❌ Spoofed extension: Unexpected response (Status', err.response?.status, ')');
@@ -66,10 +77,10 @@ async function testValidation() {
     }
 
     // 4. Test oversized file
-    console.log('\nTesting oversized file ( > 20MB)...');
+    console.log(`\nTesting oversized file ( > ${MAX_FILE_SIZE_MB}MB)...`);
     const oversizedPath = path.join(__dirname, 'oversized.pdf');
-    const buffer = Buffer.alloc(21 * 1024 * 1024); // 21MB
-    buffer.write('%PDF-1.4\n');
+    const buffer = Buffer.alloc((MAX_FILE_SIZE_MB + 1) * 1024 * 1024); // 21MB
+    buffer.write(EXPECTED_PDF_HEADER);
     fs.writeFileSync(oversizedPath, buffer);
     try {
         const form = new FormData();
@@ -79,7 +90,7 @@ async function testValidation() {
         });
         console.log('❌ Oversized file: Failed to catch!');
     } catch (err) {
-        if (err.response?.status === 400 && err.response?.data?.error === 'File too large. Maximum allowed size is 20MB.') {
+        if (err.response?.status === 400 && err.response?.data?.error === EXPECTED_ERROR_FILE_SIZE) {
             console.log('✅ Oversized file: Caught correctly (Status 400)');
         } else {
             console.log('❌ Oversized file: Unexpected response (Status', err.response?.status, ')');

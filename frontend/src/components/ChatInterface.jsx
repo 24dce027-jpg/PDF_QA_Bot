@@ -6,6 +6,14 @@ import { askQuestion, summarizeDocuments } from "../services/api";
 /**
  * ChatInterface component
  * Handles asking questions and summarizing documents
+ * @param {Object} props - Component props
+ * @param {Array} props.chatHistory - Array of chat messages
+ * @param {Array} props.selectedDocIds - IDs of selected documents
+ * @param {number} props.selectedDocCount - Count of selected documents
+ * @param {string} props.sessionId - Current session ID
+ * @param {string} props.cardClass - CSS class for card styling
+ * @param {string} props.inputClass - CSS class for input styling
+ * @param {Function} props.onChatUpdate - Callback to update chat history
  */
 const ChatInterface = ({
   chatHistory,
@@ -45,9 +53,10 @@ const ChatInterface = ({
         confidence: response.confidence,
       });
     } catch (error) {
+      console.error("Question submission error:", error.message);
       onChatUpdate({
         role: "bot",
-        text: `Error: ${error.message}`,
+        text: `Error: ${error.message || "Failed to get answer"}`,
       });
     } finally {
       setAsking(false);
@@ -63,9 +72,10 @@ const ChatInterface = ({
         text: response.text,
       });
     } catch (error) {
+      console.error("Summarization error:", error.message);
       onChatUpdate({
         role: "bot",
-        text: `Error: ${error.message}`,
+        text: `Error: ${error.message || "Failed to summarize documents"}`,
       });
     } finally {
       setSummarizing(false);

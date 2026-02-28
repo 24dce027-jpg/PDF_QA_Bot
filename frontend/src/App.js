@@ -4,8 +4,17 @@ import { Container, Typography, Box, Button, TextField, Paper, Avatar, CircularP
 import UploadFileIcon from '@mui/icons-material/UploadFile';
 import SendIcon from '@mui/icons-material/Send';
 
+// Constants for API and storage
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:4000";
 const CHAT_HISTORY_KEY = "pdf_bot_chat_history";
 const SESSION_ID_KEY = "pdf_bot_session_id";
+const SESSION_ID_PREFIX = "session_";
+const SESSION_CHAR_LENGTH = 9;
+
+/**
+ * Frontend App component for PDF Q&A Bot
+ * Manages file upload, chat interface, and session persistence
+ */
 
 function App() {
   const [file, setFile] = useState(null);
@@ -14,8 +23,8 @@ function App() {
     try {
       const saved = localStorage.getItem(CHAT_HISTORY_KEY);
       return saved ? JSON.parse(saved) : [];
-    } catch (e) {
-      console.error("Error parsing chat history from localStorage:", e);
+    } catch (error) {
+      console.error("Error parsing chat history from localStorage:", error.message);
       return [];
     }
   });
@@ -28,7 +37,7 @@ function App() {
   // Initialize Session ID on mount if it doesn't exist
   useEffect(() => {
     if (!sessionId) {
-      const newId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const newId = `${SESSION_ID_PREFIX}${Date.now()}_${Math.random().toString(36).substring(2, SESSION_CHAR_LENGTH + 2)}`;
       setSessionId(newId);
       localStorage.setItem(SESSION_ID_KEY, newId);
     }
@@ -67,10 +76,10 @@ function App() {
     formData.append("sessionId", sessionId);
 
     try {
-      await axios.post("http://localhost:4000/upload", formData);
+      await axios.post(`${API_BASE}/upload`, formData);
       alert("PDF uploaded successfully!");
-    } catch (e) {
-      console.error(e);
+    } catch (error) {
+      console.error("Upload failed:", error.message);
       alert("Upload failed. Ensure the server and RAG service are running.");
     }
     setUploading(false);
@@ -83,7 +92,7 @@ function App() {
     setChat(prev => [...prev, userMsg]);
 
     try {
-      const res = await axios.post("http://localhost:4000/ask", {
+      const res = await axios.post(`${API_BASE}/ask`, {
         question: question.trim(),
         sessionId: sessionId
       });
@@ -92,7 +101,8 @@ function App() {
         text: res.data.answer,
         citations: res.data.citations || []
       }]);
-    } catch (e) {
+    } catch (error) {
+      console.error("Failed to get answer:", error.message);
       setChat(prev => [...prev, { role: "bot", text: "Error getting answer. Please check if the document was uploaded for this session.", citations: [] }]);
     }
     setQuestion("");

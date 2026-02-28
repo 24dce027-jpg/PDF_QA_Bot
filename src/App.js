@@ -16,8 +16,17 @@ import {
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import SendIcon from "@mui/icons-material/Send";
 
+// Constants
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:4000";
 const CHAT_HISTORY_KEY = "pdf_bot_chat_history";
 const SESSION_ID_KEY = "pdf_bot_session_id";
+const SESSION_ID_PREFIX = "session_";
+const SESSION_CHAR_LENGTH = 9;
+
+/**
+ * Main App component for PDF Q&A Bot
+ * Manages file upload, chat history, and session state
+ */
 
 function App() {
   const [file, setFile] = useState(null);
@@ -26,8 +35,8 @@ function App() {
     try {
       const saved = localStorage.getItem(CHAT_HISTORY_KEY);
       return saved ? JSON.parse(saved) : [];
-    } catch (e) {
-      console.error("Error parsing chat history from localStorage:", e);
+    } catch (error) {
+      console.error("Error parsing chat history from localStorage:", error.message);
       return [];
     }
   });
@@ -40,9 +49,9 @@ function App() {
   // Initialize session ID once
   useEffect(() => {
     if (!sessionId) {
-      const newId = `session_${Date.now()}_${Math.random()
+      const newId = `${SESSION_ID_PREFIX}${Date.now()}_${Math.random()
         .toString(36)
-        .substring(2, 9)}`;
+        .substring(2, SESSION_CHAR_LENGTH + 2)}`;
       setSessionId(newId);
       localStorage.setItem(SESSION_ID_KEY, newId);
     }
@@ -83,10 +92,10 @@ function App() {
     formData.append("sessionId", sessionId);
 
     try {
-      await axios.post("http://localhost:4000/upload", formData);
+      await axios.post(`${API_BASE}/upload`, formData);
       alert("PDF uploaded successfully!");
-    } catch (e) {
-      console.error(e);
+    } catch (error) {
+      console.error("Upload failed:", error.message);
       alert("Upload failed. Ensure backend is running.");
     }
 
@@ -101,13 +110,14 @@ function App() {
     setChat((prev) => [...prev, userMsg]);
 
     try {
-      const res = await axios.post("http://localhost:4000/ask", {
+      const res = await axios.post(`${API_BASE}/ask`, {
         question: question.trim(),
         sessionId: sessionId,
       });
 
       setChat((prev) => [...prev, { role: "bot", text: res.data.answer }]);
-    } catch {
+    } catch (error) {
+      console.error("Failed to get answer:", error.message);
       setChat((prev) => [
         ...prev,
         {
@@ -126,8 +136,11 @@ function App() {
       return;
 
     try {
-      await axios.post("http://localhost:4000/clear-history");
-    } catch { }
+      await axios.post(`${API_BASE}/clear-history`);
+    } catch (error) {
+      console.error("Failed to clear server-side history:", error.message);
+      // Server-side clear failed, but we'll still clear local history
+    }
 
     setChat([]);
     localStorage.removeItem(CHAT_HISTORY_KEY);

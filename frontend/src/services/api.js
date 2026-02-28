@@ -1,11 +1,16 @@
 import axios from "axios";
 
-const API_BASE = process.env.REACT_APP_API_URL || "";
+// Constants for API configuration
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:4000";
+const REQUEST_TIMEOUT_MS = 90_000; // 90 seconds
+const UPLOAD_TIMEOUT_MS = 90_000; // 90 seconds for file upload
+const QUERY_TIMEOUT_MS = 60_000; // 60 seconds for queries
+const MAX_QUESTION_LENGTH = 2000; // Max characters allowed in a question
 
 // Create axios instance with default config
 const apiClient = axios.create({
   baseURL: API_BASE,
-  timeout: 90000,
+  timeout: REQUEST_TIMEOUT_MS,
 });
 
 /**
@@ -20,7 +25,7 @@ export const uploadDocument = async (file, sessionId) => {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 90_000);
+  const timeoutId = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
 
   try {
     const formData = new FormData();
@@ -41,7 +46,7 @@ export const uploadDocument = async (file, sessionId) => {
     if (error.name === "AbortError" || error.code === "ECONNABORTED") {
       throw new Error("Upload timed out. Try a smaller document.");
     }
-    throw new Error("Upload failed: " + (error.message || "Unknown error"));
+    throw new Error(`Upload failed: ${error.message || "Unknown error"}`);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -63,12 +68,12 @@ export const askQuestion = async (question, sessionId, doc_ids) => {
     throw new Error("Please select at least one document");
   }
 
-  if (question.length > 2000) {
-    throw new Error("Question too long (max 2000 characters)");
+  if (question.length > MAX_QUESTION_LENGTH) {
+    throw new Error(`Question too long (max ${MAX_QUESTION_LENGTH} characters)`);
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+  const timeoutId = setTimeout(() => controller.abort(), QUERY_TIMEOUT_MS);
 
   try {
     const res = await apiClient.post(
@@ -89,7 +94,7 @@ export const askQuestion = async (question, sessionId, doc_ids) => {
     if (error.name === "AbortError" || error.code === "ECONNABORTED") {
       throw new Error("Request timed out.");
     }
-    throw new Error("Error getting answer: " + (error.message || "Unknown error"));
+    throw new Error(`Error getting answer: ${error.message || "Unknown error"}`);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -116,7 +121,7 @@ export const summarizeDocuments = async (sessionId, doc_ids) => {
       text: res.data.summary,
     };
   } catch (error) {
-    throw new Error("Error summarizing: " + (error.message || "Unknown error"));
+    throw new Error(`Error summarizing: ${error.message || "Unknown error"}`);
   }
 };
 
@@ -141,7 +146,7 @@ export const compareDocuments = async (sessionId, doc_ids) => {
       text: res.data.comparison || res.data.result || "",
     };
   } catch (error) {
-    throw new Error("Error comparing documents: " + (error.message || "Unknown error"));
+    throw new Error(`Error comparing documents: ${error.message || "Unknown error"}`);
   }
 };
 

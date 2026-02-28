@@ -3,6 +3,8 @@ import { useState, useEffect } from "react";
 /**
  * Custom hook for managing session ID
  * Generates a unique session ID on mount for session isolation
+ * Uses crypto.randomUUID() if available, falls back to Math.random()
+ * @returns {string} Unique session identifier
  */
 export const useSession = () => {
   const [sessionId, setSessionId] = useState("");

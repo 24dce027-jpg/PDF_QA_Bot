@@ -5,7 +5,12 @@ import { compareDocuments } from "../services/api";
 
 /**
  * ComparisonView component
- * Displays comparison between two selected documents
+ * Displays comparison analysis between two selected documents
+ * @param {Object} props - Component props
+ * @param {Array} props.selectedDocNames - Names of selected documents
+ * @param {Array} props.selectedDocIds - IDs of selected documents
+ * @param {string} props.sessionId - Current session ID
+ * @param {string} props.cardClass - CSS class for card styling
  */
 const ComparisonView = ({
   selectedDocNames,
@@ -27,7 +32,8 @@ const ComparisonView = ({
       const response = await compareDocuments(sessionId, selectedDocIds);
       setComparisonResult(response.text);
     } catch (error) {
-      alert(error.message);
+      console.error("Document comparison error:", error.message);
+      alert(error.message || "Comparison failed. Please try again.");
       setComparisonResult(null);
     } finally {
       setComparing(false);
@@ -52,7 +58,7 @@ const ComparisonView = ({
           onClick={handleCompare}
           disabled={comparing}
           className="mb-3"
-          Block="true"
+          block
         >
           {comparing ? (
             <>
